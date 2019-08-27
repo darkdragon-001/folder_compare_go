@@ -9,72 +9,13 @@ package main
 
 import (
   "fmt"
-  "io/ioutil"
-  "path/filepath"
   "sync"
   "os"
+  "time"
 )
 
-var prefixes [2]string
 
-func children2map(children []os.FileInfo) (dirs, files map[string]os.FileInfo) {
-  dirs = make(map[string]os.FileInfo)
-  files = make(map[string]os.FileInfo)
-  for _, f := range children {
-    if f.IsDir() {
-      dirs[f.Name()] = f
-    } else {
-      files[f.Name()] = f
-    }
-  }
-  return
-}
-
-type Filter func(f os.FileInfo)bool
-func filter(a []os.FileInfo, keep Filter)[]os.FileInfo {
-  n := 0
-  for _, x := range a {
-  	if keep(x) {
-  		a[n] = x
-  		n++
-  	}
-  }
-  return a[:n]
-}
-func read_dirs(dir string) (dirs, files [2]map[string]os.FileInfo) {
-  for i := 0; i < 2; i++ {
-    // TODO inspect error -> retry if suffix "too many open files"?
-    children, e := ioutil.ReadDir(filepath.Join(prefixes[i],dir))
-    if e!=nil { fmt.Println("Error reading directory:",e) }
-    // NOTE optional filter hidden files
-    //children = filter(children, func(f os.FileInfo)bool{return f.Name()[0]!='.'})
-    dirs[i],files[i] = children2map(children)
-  }
-  return
-}
-
-type FilePair struct { f0 os.FileInfo; f1 os.FileInfo }
-func compare(m0, m1 map[string]os.FileInfo) (mboth map[string]FilePair, mA, mB map[string]os.FileInfo)  {
-  // initialize
-  mboth = make(map[string]FilePair)
-  mA = make(map[string]os.FileInfo)
-  mB = make(map[string]os.FileInfo)
-  // compare
-  for name, f0 := range m0 {
-    if f1, ok := m1[name]; ok {
-      mboth[name] = FilePair{f0, f1}
-      delete(m1, name)
-    } else {
-      mA[name] = f0
-    }
-    delete(m0, name)
-  }
-  mB = m1
-  //fmt.Println("both",mboth,"A",mA,"B",mB)
-  return
-}
-
-func process(sem chan bool, dir string, wg *sync.WaitGroup) {
+func process(sem chan bool, dir *Dir, wg *sync.WaitGroup) {
   // Decreasing internal counter for wait-group as soon as goroutine finishes
   defer wg.Done()
 
@@ -82,25 +23,16 @@ func process(sem chan bool, dir string, wg *sync.WaitGroup) {
   sem <- true
   defer func() { <-sem }()
 
-  //fmt.Println("Process item", dir)
-  dirs, files := read_dirs(dir)
-  dirsboth, dirsA, dirsB := compare(dirs[0], dirs[1])
-  filesboth, filesA, filesB := compare(files[0], files[1])
-  if len(dirsA)>0 || len(filesA)>0 || len(dirsB)>0 || len(filesB)>0 {
-    // TODO format better via fmt.Printf()
-    fmt.Println("<>",dir,":: OnlyA:",dirsA,filesA,"OnlyB:",dirsB,filesB)
-  }
+  // Process directory
+  processDir(dir)
 
-  for dn, _ := range dirsboth {
+  // Process children
+  for _, d := range dir.dirs.both {
     wg.Add(1)
-    go process( sem, filepath.Join( dir, dn ), wg )
+    go process( sem, d, wg )
   }
-  for fn, f := range filesboth {
-    // TODO compare content if wanted
-    if f.f0.Size()!=f.f1.Size() || f.f0.ModTime()!=f.f1.ModTime() {
-      fmt.Println("<>",dir,":: Files not equal:",fn)
-    }
-  }
+  // Logging
+  fmt.Print(dir.formatChanges())
 }
 
 func main() {
@@ -108,20 +40,40 @@ func main() {
 
   // initialize folders to compare
   if len(os.Args) == 3 {
-    prefixes[0] = os.Args[1]
-    prefixes[1] = os.Args[2]
+    SetPrefixes(os.Args[1],os.Args[2])
+    fmt.Printf("Comparing \"%s\" to \"%s\"\n", os.Args[1], os.Args[2])
   } else {
+    fmt.Println("Please specify the folders to compare as arguments.")
     return
   }
+  dir := NewDirRoot()
 
   // Create semaphore to limit number of workers
   // Without this limit, OS runs out of file descriptors and thus returns invalid results
-  sem := make(chan bool, 100)
+  sem := make(chan bool, 4)
 
-  // Adding root item
+  // Start measuring time
+  start := time.Now()
+
+  // Process directory
   wg.Add(1)
-  go process(sem,".", wg)
+  go process(sem, dir, wg)
 
   // Waiting for all goroutines to finish (otherwise they die as main routine dies)
   wg.Wait()
+
+  // Calculate elapsed time
+  elapsed := time.Since(start)
+  fmt.Printf("Elapsed time %s\n", elapsed)
+
+  // Propagate directory state up to root
+  fmt.Println("Propagate states")
+  dir.updateStates()
+
+  // Inspect result
+  // NOTE this fills up several GB of RAM for big folders within very short time!
+  // -> better use print in process() or save to file
+  //fmt.Println("Inspect result")
+  //dir.printRecursive()
 }
+
