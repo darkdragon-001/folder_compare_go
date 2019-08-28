@@ -50,7 +50,7 @@ func main() {
 
   // Create semaphore to limit number of workers
   // Without this limit, OS runs out of file descriptors and thus returns invalid results
-  sem := make(chan bool, 4)
+  sem := make(chan bool, 8)
 
   // Start measuring time
   start := time.Now()

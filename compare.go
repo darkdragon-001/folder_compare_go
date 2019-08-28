@@ -13,31 +13,12 @@ import (
 
 // COMPARING NODES
 
-// TODO is is possible to create some sort of template so declare function only once?
-// TODO create compare function which works without converting first to map
-func compareDirs(dir *Dir, m0, m1 map[string]os.FileInfo) *Dir {
-  var NodeFactory Dir
-  nodes := &dir.dirs
-  for name, f0 := range m0 {
-    if f1, ok := m1[name]; ok {
-      nodes.both = append(nodes.both, NodeFactory.New(dir, name, f0, f1, STATE_UNKNOWN))  // TODO only equal when all childs equal; NOTE comparison of TimeModified possible
-      delete(m1, name)
-    } else {
-      nodes.single[0] = append(nodes.single[0], NodeFactory.New(dir, name, f0, nil, STATE_A_ONLY))
-    }
-    delete(m0, name)
-  }
-  nodes.single[1] = make([]*Dir, 0, len(m1))  // allocate space
-  for name, f := range m1 {
-    nodes.single[1] = append(nodes.single[1], NodeFactory.New(dir, name, nil, f, STATE_B_ONLY))
-  }
-  return dir
-}
 func fileInfoEqual(dir *Dir, f0, f1 os.FileInfo) bool {
   if f0.Size() != f1.Size() { return false }
   //if f0.ModTime() != f1.ModTime() { return false }
   return true
 }
+// source: https://stackoverflow.com/a/30038571/3779655
 func fileContentEqual(dir *Dir, f0s, f1s os.FileInfo) bool {
   // compare file size
   if f0s.Size() != f1s.Size() {
@@ -45,6 +26,7 @@ func fileContentEqual(dir *Dir, f0s, f1s os.FileInfo) bool {
   }
 
   // open files for reading
+  // TODO check type -> sockets etc. can't be opened for reading, broken/dangling symlink, ...
   paths := dir.paths()
   f0, err := os.Open(filepath.Join(paths[0],f0s.Name()))
   defer f0.Close()
@@ -84,42 +66,58 @@ func fileContentEqual(dir *Dir, f0s, f1s os.FileInfo) bool {
     }
   }
 }
-func compareFiles(dir *Dir, m0, m1 map[string]os.FileInfo) *Dir {
-  var NodeFactory File
-  nodes := &dir.files
-  for name, f0 := range m0 {
-    if f1, ok := m1[name]; ok {
-      //filesEqual := fileInfoEqual(dir, f0,f1)
-      filesEqual := fileContentEqual(dir, f0,f1)  // TODO check type -> sockets etc. can't be opened for reading, broken/dangling symlink, ...
-      nodes.both = append(nodes.both, NodeFactory.New(dir, name, f0, f1, bool2state(filesEqual)))
-      delete(m1, name)
+
+// NOTE slice sorted -> this algorithm, unsorted -> maps: https://stackoverflow.com/a/23874300/3779655
+// TODO use additional data type for single which is same for dirs/files
+func compareNodes(dir *Dir, A, B []os.FileInfo) *Dir {
+  var i, j int
+  for i < len(A) && j < len(B) {
+    if A[i].Name() < B[j].Name() {
+      // A only
+      name := A[i].Name()
+      if A[i].IsDir() {
+        dir.dirs.single[0] = append(dir.dirs.single[0], NewDir(dir, name, A[i], nil, STATE_A_ONLY))
+      } else {
+        dir.files.single[0] = append(dir.files.single[0], NewFile(dir, name, A[i], nil, STATE_A_ONLY))
+      }
+      i++
+    } else if A[i].Name() > B[j].Name() {
+      // B only
+      name := B[j].Name()
+      if A[i].IsDir() {
+        dir.dirs.single[1] = append(dir.dirs.single[1], NewDir(dir, name, nil, B[j], STATE_A_ONLY))
+      } else {
+        dir.files.single[1] = append(dir.files.single[1], NewFile(dir, name, nil, B[j], STATE_A_ONLY))
+      }
+      j++
     } else {
-      nodes.single[0] = append(nodes.single[0], NodeFactory.New(dir, name, f0, nil, STATE_A_ONLY))
+      // both
+      name := A[i].Name()
+      if A[i].IsDir() && B[j].IsDir() {
+        dir.dirs.both = append(dir.dirs.both, NewDir(dir, name, A[i], B[j], STATE_UNKNOWN))
+      } else if !A[i].IsDir() && !B[j].IsDir() {
+        // compare files
+        filesEqual := fileInfoEqual(dir, A[i], B[j])
+        //filesEqual := fileContentEqual(dir, A[i], B[j])
+        dir.files.both = append(dir.files.both, NewFile(dir, name, A[i], B[j], bool2state(filesEqual)))
+      } else {
+        if A[i].IsDir() {  // A dir, B file
+          dir.dirs.single[0] = append(dir.dirs.single[0], NewDir(dir, name, A[i], nil, STATE_A_ONLY))
+          dir.files.single[1] = append(dir.files.single[1], NewFile(dir, name, nil, B[j], STATE_A_ONLY))
+        } else {  // A file, B dir
+          dir.files.single[0] = append(dir.files.single[0], NewFile(dir, name, A[i], nil, STATE_A_ONLY))
+          dir.dirs.single[1] = append(dir.dirs.single[1], NewDir(dir, name, nil, B[j], STATE_A_ONLY))
+        }
+      }
+      i++
+      j++
     }
-    delete(m0, name)
-  }
-  nodes.single[1] = make([]*File, 0, len(m1))  // allocate space
-  for name, f := range m1 {
-    nodes.single[1] = append(nodes.single[1], NodeFactory.New(dir, name, nil, f, STATE_B_ONLY))
   }
   return dir
 }
 
 
 // PROCESS DIRECTORIES
-
-func children2map(children []os.FileInfo) (dirs, files map[string]os.FileInfo) {
-  dirs = make(map[string]os.FileInfo)
-  files = make(map[string]os.FileInfo)
-  for _, f := range children {
-    if f.IsDir() {
-      dirs[f.Name()] = f
-    } else {
-      files[f.Name()] = f
-    }
-  }
-  return
-}
 
 type Filter func(f os.FileInfo)bool
 func filter(a []os.FileInfo, keep Filter)[]os.FileInfo {
@@ -132,23 +130,18 @@ func filter(a []os.FileInfo, keep Filter)[]os.FileInfo {
   }
   return a[:n]
 }
-func read_dirs(dir *Dir) (dirs, files [2]map[string]os.FileInfo) {
-  paths := dir.paths()
-  for i := 0; i < 2; i++ {
-    // TODO inspect error -> retry if suffix "too many open files"?
-    children, e := ioutil.ReadDir(paths[i])
-    if e!=nil { fmt.Println("Error reading directory:",e) }
-    // NOTE optional filter hidden files
-    //children = filter(children, func(f os.FileInfo)bool{return f.Name()[0]!='.'})
-    dirs[i],files[i] = children2map(children)
-  }
-  return
-}
 
 func processDir(dir *Dir) {
   //fmt.Println("Process", dir.path())
-  dirs, files := read_dirs(dir)
-  compareDirs(dir, dirs[0], dirs[1])
-  compareFiles(dir, files[0], files[1])
+  paths := dir.paths()
+  var nodes [2][]os.FileInfo; var e error
+  for i := 0; i < 2; i++ {
+    // TODO inspect error -> retry if suffix "too many open files"?
+    nodes[i], e = ioutil.ReadDir(paths[i])
+    if e!=nil { fmt.Println("Error reading directory:",e) }
+    // NOTE optional filter hidden files
+    //nodes[i] = filter(nodes[i], func(f os.FileInfo)bool{return f.Name()[0]!='.'})
+  }
+  compareNodes(dir, nodes[0], nodes[1])
 }
 
